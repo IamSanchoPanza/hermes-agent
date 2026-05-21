@@ -3530,6 +3530,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
+        # Cached account usage for the persistent status bar. This lets the
+        # renderer read the last-known Codex limits without blocking on network
+        # I/O during every repaint.
+        self._account_usage_snapshot = None
+        self._account_usage_last_refresh = 0.0
+        self._account_usage_cache_key_state = None
+        self._account_usage_refresh_inflight = False
+        self._account_usage_refresh_lock = threading.Lock()
         # When True, the input separator rules and the dynamic status bar are
         # hidden until the next user input. Set by _recover_after_resize() so a
         # SIGWINCH cannot stamp a freshly-drawn status bar on top of one that
@@ -3903,6 +3911,133 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         return snapshot
 
+    def _account_usage_cache_key(self) -> Optional[tuple[str, str, str]]:
+        """Return the provider/base_url/api_key tuple for Codex usage caching."""
+        agent = getattr(self, "agent", None)
+        provider = (getattr(agent, "provider", None) or getattr(self, "provider", None) or "").strip()
+        if provider != "openai-codex":
+            return None
+        base_url = (getattr(agent, "base_url", None) or getattr(self, "base_url", None) or "").strip()
+        api_key = (getattr(agent, "api_key", None) or getattr(self, "api_key", None) or "").strip()
+        return provider, base_url, api_key
+
+    def _schedule_account_usage_refresh(self) -> None:
+        """Refresh cached account usage in the background, at most one worker at a time."""
+        cache_key = self._account_usage_cache_key()
+        if not cache_key:
+            return
+
+        lock = getattr(self, "_account_usage_refresh_lock", None)
+        if lock is None:
+            return
+
+        with lock:
+            if self._account_usage_refresh_inflight:
+                return
+            self._account_usage_refresh_inflight = True
+
+        def _worker(key: tuple[str, str, str]) -> None:
+            snapshot = None
+            try:
+                from agent.account_usage import fetch_account_usage
+
+                provider, base_url, api_key = key
+                snapshot = fetch_account_usage(
+                    provider,
+                    base_url=base_url or None,
+                    api_key=api_key or None,
+                )
+            except Exception:
+                snapshot = None
+            finally:
+                try:
+                    with lock:
+                        self._account_usage_refresh_inflight = False
+                except Exception:
+                    pass
+
+            if snapshot is not None:
+                try:
+                    if self._account_usage_cache_key_state == key:
+                        self._account_usage_snapshot = snapshot
+                        self._account_usage_last_refresh = time.monotonic()
+                except Exception:
+                    pass
+            try:
+                self._invalidate(min_interval=0.0)
+            except Exception:
+                pass
+
+        self._account_usage_cache_key_state = cache_key
+        threading.Thread(target=_worker, args=(cache_key,), daemon=True).start()
+
+    def _cached_account_usage_snapshot(self):
+        """Return a fresh-enough account-usage snapshot, refreshing in the background if stale."""
+        cache_key = self._account_usage_cache_key()
+        if not cache_key:
+            return None
+
+        if self._account_usage_cache_key_state != cache_key:
+            self._account_usage_cache_key_state = cache_key
+            self._account_usage_snapshot = None
+            self._account_usage_last_refresh = 0.0
+            self._account_usage_refresh_inflight = False
+
+        snapshot = getattr(self, "_account_usage_snapshot", None)
+        if snapshot is not None and (time.monotonic() - getattr(self, "_account_usage_last_refresh", 0.0)) < 300:
+            return snapshot
+
+        self._schedule_account_usage_refresh()
+        return snapshot
+
+    def _account_usage_status_label(self, width: int) -> str:
+        """Return a compact label for Codex remaining limits in the status bar."""
+        snapshot = self._cached_account_usage_snapshot()
+        if not snapshot or not getattr(snapshot, "windows", None):
+            return ""
+
+        wide = width >= 110
+        parts: list[str] = []
+        for window in snapshot.windows[:2]:
+            if window.used_percent is None:
+                continue
+            remaining = max(0, round(100 - float(window.used_percent)))
+            label = (window.label or "Limit").strip().lower()
+            if label.startswith("session"):
+                label = "Session" if wide else "5h"
+            elif label.startswith("weekly") or label.startswith("week"):
+                label = "Weekly" if wide else "7d"
+            elif len(label) > 10:
+                label = label[:10]
+            else:
+                label = label.title()
+            parts.append(f"{label} {remaining}%")
+
+        if not parts:
+            return ""
+        return " │ ".join(parts) if wide else " · ".join(parts)
+
+    def _account_usage_status_style(self) -> str:
+        """Color the account-usage badge based on remaining headroom."""
+        snapshot = getattr(self, "_account_usage_snapshot", None)
+        if not snapshot or not getattr(snapshot, "windows", None):
+            return "class:status-bar-dim"
+        worst_remaining = None
+        for window in snapshot.windows:
+            if window.used_percent is None:
+                continue
+            remaining = max(0, 100 - int(round(float(window.used_percent))))
+            worst_remaining = remaining if worst_remaining is None else min(worst_remaining, remaining)
+        if worst_remaining is None:
+            return "class:status-bar-dim"
+        if worst_remaining <= 5:
+            return "class:status-bar-critical"
+        if worst_remaining <= 20:
+            return "class:status-bar-bad"
+        if worst_remaining <= 50:
+            return "class:status-bar-warn"
+        return "class:status-bar-good"
+
     @staticmethod
     def _status_bar_display_width(text: str) -> int:
         """Return terminal cell width for status-bar text.
@@ -4108,6 +4243,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 text = f"⚕ {snapshot['model_short']} · {duration_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
+                if not yolo_active:
+                    account_label = self._account_usage_status_label(width)
+                    if account_label:
+                        text += f" · {account_label}"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
@@ -4123,6 +4262,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 parts.append(duration_label)
                 if yolo_active:
                     parts.append("⚠ YOLO")
+                account_label = self._account_usage_status_label(width)
+                if account_label:
+                    parts.append(account_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
             if snapshot["context_length"]:
@@ -4148,6 +4290,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 parts.append(prompt_elapsed)
             if yolo_active:
                 parts.append("⚠ YOLO")
+            account_label = self._account_usage_status_label(width)
+            if account_label:
+                parts.append(account_label)
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -4176,6 +4321,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                if not yolo_active:
+                    account_label = self._account_usage_status_label(width)
+                    if account_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " · "),
+                            (self._account_usage_status_style(), account_label),
+                        ])
                 frags.append(("class:status-bar", " "))
             else:
                 percent = snapshot["context_percent"]
@@ -4206,6 +4358,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    account_label = self._account_usage_status_label(width)
+                    if account_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " · "),
+                            (self._account_usage_status_style(), account_label),
+                        ])
                     frags.append(("class:status-bar", " "))
                 else:
                     if snapshot["context_length"]:
@@ -4250,6 +4408,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    account_label = self._account_usage_status_label(width)
+                    if account_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append((self._account_usage_status_style(), account_label))
                     frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
@@ -8233,6 +8395,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             print()
             for line in account_lines:
                 print(line)
+        if account_snapshot is not None:
+            self._account_usage_snapshot = account_snapshot
+            self._account_usage_last_refresh = time.monotonic()
+            self._account_usage_cache_key_state = self._account_usage_cache_key()
 
         # Nous credits magnitudes + monthly-grant gauge (agent-independent — also
         # runs at the no-agent / no-calls early-returns above). See the helper.

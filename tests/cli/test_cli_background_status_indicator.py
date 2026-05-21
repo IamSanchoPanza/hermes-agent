@@ -7,8 +7,10 @@ finally block, so len() reflects truly-running tasks.
 """
 
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
+from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
 from cli import HermesCLI
 
 
@@ -23,9 +25,27 @@ def _make_cli():
     cli_obj.model = "anthropic/claude-opus-4.6"
     cli_obj.agent = None
     cli_obj._background_tasks = {}
+    cli_obj._account_usage_snapshot = None
+    cli_obj._account_usage_last_refresh = 0.0
+    cli_obj._account_usage_cache_key_state = None
+    cli_obj._account_usage_refresh_inflight = False
+    cli_obj._account_usage_refresh_lock = threading.Lock()
     # The snapshot reads session_start to compute duration; supply a stub.
     cli_obj.session_start = datetime.now()
     return cli_obj
+
+
+def _make_account_snapshot():
+    return AccountUsageSnapshot(
+        provider="openai-codex",
+        source="test",
+        fetched_at=datetime.now(timezone.utc),
+        title="Account limits",
+        windows=(
+            AccountUsageWindow(label="Session", used_percent=15.0),
+            AccountUsageWindow(label="Weekly", used_percent=28.0),
+        ),
+    )
 
 
 def test_snapshot_reports_zero_when_no_background_tasks():
@@ -102,6 +122,66 @@ def test_fragments_omit_bg_segment_when_idle():
     frags = cli_obj._get_status_bar_fragments()
     rendered = "".join(text for _style, text in frags)
     assert "▶" not in rendered
+
+
+def test_plain_text_status_includes_cached_account_limits():
+    cli_obj = _make_cli()
+    cli_obj.provider = "openai-codex"
+    cli_obj._account_usage_snapshot = _make_account_snapshot()
+    cli_obj._account_usage_last_refresh = time.monotonic()
+    cli_obj._account_usage_cache_key_state = ("openai-codex", "", "")
+    text = cli_obj._build_status_bar_text(width=120)
+    assert "Session 85%" in text
+    assert "Weekly 72%" in text
+
+
+def test_fragments_include_cached_account_limits():
+    cli_obj = _make_cli()
+    cli_obj.provider = "openai-codex"
+    cli_obj._account_usage_snapshot = _make_account_snapshot()
+    cli_obj._account_usage_last_refresh = time.monotonic()
+    cli_obj._account_usage_cache_key_state = ("openai-codex", "", "")
+    cli_obj._status_bar_visible = True
+    cli_obj._get_tui_terminal_width = lambda: 120  # type: ignore[method-assign]
+    frags = cli_obj._get_status_bar_fragments()
+    rendered = "".join(text for _style, text in frags)
+    assert "Session 85%" in rendered
+    assert "Weekly 72%" in rendered
+
+
+def test_narrow_plain_text_keeps_yolo_before_account_limits(monkeypatch):
+    cli_obj = _make_cli()
+    cli_obj.model = "gpt-5.5-super-longish"
+    cli_obj.provider = "openai-codex"
+    cli_obj._account_usage_snapshot = _make_account_snapshot()
+    cli_obj._account_usage_last_refresh = time.monotonic()
+    cli_obj._account_usage_cache_key_state = ("openai-codex", "", "")
+    import tools.approval as approval_mod
+    monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", True)
+
+    text = cli_obj._build_status_bar_text(width=40)
+
+    assert "⚠ YOLO" in text
+    assert "5h 85%" not in text
+
+
+def test_narrow_fragments_keep_yolo_before_account_limits(monkeypatch):
+    cli_obj = _make_cli()
+    cli_obj.model = "gpt-5.5-super-longish"
+    cli_obj.provider = "openai-codex"
+    cli_obj._account_usage_snapshot = _make_account_snapshot()
+    cli_obj._account_usage_last_refresh = time.monotonic()
+    cli_obj._account_usage_cache_key_state = ("openai-codex", "", "")
+    cli_obj._status_bar_visible = True
+    cli_obj._get_tui_terminal_width = lambda: 40  # type: ignore[method-assign]
+    import tools.approval as approval_mod
+    monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", True)
+
+    frags = cli_obj._get_status_bar_fragments()
+    rendered = "".join(text for _style, text in frags)
+
+    assert "⚠ YOLO" in rendered
+    assert "5h 85%" not in rendered
 
 
 # ── Background terminal-process indicator (⚙ N) ───────────────────────────
