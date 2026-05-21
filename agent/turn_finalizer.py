@@ -42,6 +42,9 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    deferred_compression_tokens=None,
+    active_system_prompt=None,
+    system_message=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -127,6 +130,48 @@ def finalize_turn(
         and api_call_count < agent.max_iterations
         and not failed
     )
+
+    # Deferred proactive context compression.
+    #
+    # The old behaviour compacted immediately after a tool batch crossed the
+    # threshold, before the follow-up LLM call that usually produces the final
+    # answer. That made the user wait for summarisation before their prompt was
+    # answered. Instead, let the turn finish first and compact the resulting
+    # transcript here, just before persistence. Reactive compression for real
+    # provider context/payload errors remains synchronous in the retry paths
+    # of the main loop, because the request cannot proceed otherwise.
+    if (
+        completed
+        and final_response
+        and not interrupted
+        and agent.compression_enabled
+        and deferred_compression_tokens is not None
+    ):
+        try:
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            current_tokens = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=agent.tools or None,
+            )
+            compression_tokens = max(current_tokens, deferred_compression_tokens)
+            if agent.context_compressor.should_compress(compression_tokens):
+                agent._safe_print("  ⟳ compacting context after response…")
+                original_len = len(messages)
+                messages, active_system_prompt = agent._compress_context(
+                    messages,
+                    system_message,
+                    approx_tokens=compression_tokens,
+                    task_id=effective_task_id,
+                )
+                if len(messages) < original_len:
+                    # Compression created a new session — clear history so
+                    # _flush_messages_to_session_db writes compressed messages
+                    # to the new session (see preflight compression comment).
+                    conversation_history = None
+        except Exception as exc:
+            logger.warning("Deferred post-response compression failed: %s", exc)
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.

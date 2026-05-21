@@ -115,6 +115,67 @@ def test_openai_prompt_tokens_unchanged(monkeypatch):
     assert agent.context_compressor.last_prompt_tokens == 5000
 
 
+def test_proactive_compression_is_deferred_until_after_final_response(monkeypatch):
+    """Crossing the compression threshold after tools must not delay the answer.
+
+    The first model call returns a tool call with enough prompt tokens to cross
+    the threshold. Hermes should execute the tool and ask the model for the
+    final answer before compacting, so compaction cannot block the answer step.
+    """
+    events = []
+    calls = iter([
+        SimpleNamespace(
+            choices=[SimpleNamespace(index=0, message=SimpleNamespace(
+                role="assistant",
+                content="checking",
+                tool_calls=[SimpleNamespace(
+                    id="call-1",
+                    function=SimpleNamespace(name="t", arguments="{}"),
+                )],
+                reasoning_content=None,
+            ), finish_reason="tool_calls")],
+            usage=SimpleNamespace(prompt_tokens=200, completion_tokens=10, total_tokens=210),
+            model="gpt-4o",
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(index=0, message=SimpleNamespace(
+                role="assistant", content="final answer", tool_calls=None, reasoning_content=None,
+            ), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=220, completion_tokens=20, total_tokens=240),
+            model="gpt-4o",
+        ),
+    ])
+
+    def resp():
+        events.append(f"api{len([e for e in events if e.startswith('api')]) + 1}")
+        return next(calls)
+
+    agent = _make_agent(monkeypatch, "chat_completions", "openrouter", resp)
+    agent.context_compressor.threshold_tokens = 100
+    agent.context_compressor.should_compress = lambda tokens: tokens >= 100
+
+    def fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        events.append("tools")
+        messages.append({
+            "role": "tool",
+            "name": "t",
+            "tool_call_id": "call-1",
+            "content": "tool result",
+        })
+
+    def fake_compress(messages, system_message, **kwargs):
+        events.append("compress")
+        return messages[:-1], agent._cached_system_prompt or "system"
+
+    agent._execute_tool_calls = fake_execute_tool_calls
+    agent._compress_context = fake_compress
+
+    result = agent.run_conversation("hi")
+
+    assert result["final_response"] == "final answer"
+    assert events == ["api1", "tools", "api2", "compress"]
+
+
 # -- Codex: no cache fields, getattr returns 0 --
 
 def test_codex_no_cache_fields(monkeypatch):

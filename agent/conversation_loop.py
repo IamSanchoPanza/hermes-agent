@@ -468,6 +468,7 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    deferred_compression_tokens: Optional[int] = None
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
@@ -3848,16 +3849,20 @@ def run_conversation(
                     )
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
-                    agent._safe_print("  ⟳ compacting context…")
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
-                        task_id=effective_task_id,
+                    # Defer proactive compaction until this user-visible turn has
+                    # produced its final answer. Compacting immediately after a
+                    # tool batch makes the user wait for summarisation before the
+                    # model can process the tool results and answer the prompt.
+                    # Context-overflow recovery paths above still compress
+                    # synchronously when a provider rejects the next request.
+                    deferred_compression_tokens = _real_tokens
+                    logger.info(
+                        "Deferring proactive context compression until after response "
+                        "(tokens=~%s threshold=%s session=%s)",
+                        f"{_real_tokens:,}",
+                        f"{_compressor.threshold_tokens:,}",
+                        agent.session_id or "none",
                     )
-                    # Compression created a new session — clear history so
-                    # _flush_messages_to_session_db writes compressed messages
-                    # to the new session (see preflight compression comment).
-                    conversation_history = None
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
@@ -4266,6 +4271,9 @@ def run_conversation(
     from agent.turn_finalizer import finalize_turn
     return finalize_turn(
         agent,
+        deferred_compression_tokens=deferred_compression_tokens,
+        active_system_prompt=active_system_prompt,
+        system_message=system_message,
         final_response=final_response,
         api_call_count=api_call_count,
         interrupted=interrupted,

@@ -780,7 +780,7 @@ class TestToolResultPreflightCompression:
     """Compression should trigger when tool results push context past the threshold."""
 
     def test_large_tool_results_trigger_compression(self, agent):
-        """When tool results push estimated tokens past threshold, compress before next call."""
+        """When tool results push estimated tokens past threshold, compress after the answer."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000  # below the 135k reported usage
