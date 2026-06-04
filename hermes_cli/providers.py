@@ -592,6 +592,22 @@ def custom_provider_slug(display_name: str) -> str:
     return "custom:" + display_name.strip().lower().replace(" ", "-")
 
 
+def custom_provider_group_display_name(display_name: str) -> str:
+    """Strip per-model suffixes from custom provider display names.
+
+    ``list_authenticated_providers`` groups entries such as ``Ollama — GLM``
+    and ``Ollama — Qwen`` into a single ``Ollama`` picker row. Provider
+    resolution must understand the same synthetic row slug (``custom:ollama``)
+    when an interactive picker selection comes back through ``switch_model``.
+    """
+    value = (display_name or "").strip()
+    for sep in ("—", " - "):
+        if sep in value:
+            value = value.split(sep)[0].strip()
+            break
+    return value
+
+
 def resolve_custom_provider(
     name: str,
     custom_providers: Optional[List[Dict[str, Any]]],
@@ -635,6 +651,38 @@ def resolve_custom_provider(
         return ProviderDef(
             id=slug,
             name=display_name,
+            transport="openai_chat",
+            api_key_env_vars=(),
+            base_url=api_url,
+            is_aggregator=False,
+            auth_type="api_key",
+            source="user-config",
+        )
+
+    # Picker custom-provider groups use the stripped family name as a
+    # synthetic slug (e.g. two entries named "Ollama — GLM" and
+    # "Ollama — Qwen" are displayed as one "custom:ollama" row). Resolve
+    # that grouped slug back to the shared endpoint so interactive picker
+    # selections are routable.
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        display_name = (entry.get("name") or "").strip()
+        api_url = (
+            entry.get("base_url", "")
+            or entry.get("url", "")
+            or entry.get("api", "")
+            or ""
+        ).strip()
+        group_name = custom_provider_group_display_name(display_name)
+        if not group_name or not api_url or group_name == display_name:
+            continue
+        group_slug = custom_provider_slug(group_name)
+        if requested not in {group_name.lower(), group_slug}:
+            continue
+        return ProviderDef(
+            id=group_slug,
+            name=group_name,
             transport="openai_chat",
             api_key_env_vars=(),
             base_url=api_url,

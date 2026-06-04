@@ -665,6 +665,7 @@ def switch_model(
     resolved_alias = ""
     new_model = raw_input.strip()
     target_provider = current_provider
+    explicit_pdef = None
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -699,6 +700,7 @@ def switch_model(
             )
 
         target_provider = pdef.id
+        explicit_pdef = pdef
 
         # Guard against silent aggregator hops. A vendor name like bare
         # "openai" is an alias that resolves to an aggregator ("openrouter").
@@ -932,6 +934,61 @@ def switch_model(
                 api_key = _ukey
                 base_url = _user_pdef.base_url
                 api_mode = ""
+        elif (
+            explicit_pdef is not None
+            and target_provider.startswith("custom:")
+            and explicit_pdef.base_url
+        ):
+            # Saved ``custom_providers`` picker rows can be synthetic grouped
+            # slugs (e.g. ``custom:ollama`` for entries named
+            # "Ollama — GLM" + "Ollama — Qwen"). ``resolve_runtime_provider``
+            # only reads config.yaml by provider name, so use the already
+            # resolved ProviderDef endpoint and lift the matching configured
+            # credential directly from the caller-supplied custom_providers.
+            _target_url = str(explicit_pdef.base_url or "").strip().rstrip("/")
+            _ukey = ""
+            _fallback_entry = None
+            if custom_providers and isinstance(custom_providers, list):
+                for _entry in custom_providers:
+                    if not isinstance(_entry, dict):
+                        continue
+                    _entry_url = (
+                        _entry.get("base_url", "")
+                        or _entry.get("url", "")
+                        or _entry.get("api", "")
+                        or ""
+                    )
+                    if str(_entry_url).strip().rstrip("/") != _target_url:
+                        continue
+                    if _fallback_entry is None:
+                        _fallback_entry = _entry
+                    _models = []
+                    _model = str(_entry.get("model", "") or "").strip()
+                    if _model:
+                        _models.append(_model)
+                    _cfg_models = _entry.get("models", {})
+                    if isinstance(_cfg_models, dict):
+                        _models.extend(str(m) for m in _cfg_models.keys() if m)
+                    elif isinstance(_cfg_models, list):
+                        _models.extend(str(m) for m in _cfg_models if m)
+                    if new_model in _models:
+                        _fallback_entry = _entry
+                        break
+                if _fallback_entry is not None:
+                    _ukey = str(_fallback_entry.get("api_key", "") or "").strip()
+                    if _ukey.startswith("${") and _ukey.endswith("}"):
+                        _ukey = os.environ.get(_ukey[2:-1], "").strip()
+                    if not _ukey:
+                        _kenv = str(_fallback_entry.get("key_env", "") or "").strip()
+                        if _kenv:
+                            _ukey = os.environ.get(_kenv, "").strip()
+                    api_mode = str(
+                        _fallback_entry.get("api_mode")
+                        or _fallback_entry.get("transport")
+                        or ""
+                    ).strip().lower()
+            api_key = _ukey or "no-key-required"
+            base_url = _target_url
         else:
             try:
                 runtime = resolve_runtime_provider(

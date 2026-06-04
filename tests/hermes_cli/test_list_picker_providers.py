@@ -230,6 +230,8 @@ def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
     monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
     monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
                         lambda *a, **kw: [])
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models",
+                        lambda *a, **kw: [])
 
     result = model_switch.list_picker_providers(
         current_provider="custom:ollama",
@@ -259,3 +261,38 @@ def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
     assert row["slug"] == "custom:ollama"
     assert row["is_current"] is True
     assert row["models"] == ["glm-5.1", "qwen3"]
+
+
+def test_switch_model_accepts_grouped_custom_provider_slug(monkeypatch):
+    """Selecting a grouped custom provider row should route to its endpoint."""
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model",
+                        lambda *a, **kw: {"accepted": True, "persist": True})
+    monkeypatch.setattr(model_switch, "get_model_capabilities", lambda *a, **kw: {})
+    monkeypatch.setattr(model_switch, "get_model_info", lambda *a, **kw: {})
+
+    result = model_switch.switch_model(
+        "glm-5.1",
+        current_provider="openai-codex",
+        current_model="gpt-5.5",
+        explicit_provider="custom:ollama",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Ollama — GLM 5.1",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "glm-5.1",
+            },
+            {
+                "name": "Ollama — Qwen3",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": "ollama",
+                "model": "qwen3",
+            },
+        ],
+    )
+
+    assert result.success is True
+    assert result.target_provider == "custom:ollama"
+    assert result.base_url == "http://localhost:11434/v1"
+    assert result.api_key == "ollama"
