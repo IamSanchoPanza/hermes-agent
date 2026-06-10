@@ -23,9 +23,14 @@ def _reset_signal_scheduler():
 # Shared Helpers
 # ---------------------------------------------------------------------------
 
-def _make_signal_adapter(monkeypatch, account="+15551234567", **extra):
+def _make_signal_adapter(monkeypatch, account="+155****4567", allowed_users="*", **extra):
     """Create a SignalAdapter with sensible test defaults."""
-    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", extra.pop("group_allowed", ""))
+    group_allowed = extra.pop("group_allowed", None)
+    if group_allowed is None:
+        monkeypatch.delenv("SIGNAL_GROUP_ALLOWED_USERS", raising=False)
+    else:
+        monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", group_allowed)
+    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", allowed_users)
     from gateway.platforms.signal import SignalAdapter
     config = PlatformConfig()
     config.enabled = True
@@ -46,6 +51,33 @@ def _stub_rpc(return_value):
         return return_value
 
     return mock_rpc, captured
+
+
+def _make_group_envelope(
+    *,
+    sender="+166****1111",
+    sender_name="Alice",
+    sender_uuid="uuid:alice",
+    group_id="group-123",
+    group_name="Study Group",
+    text="hello there",
+    mentions=None,
+    timestamp_ms=1710000000000,
+):
+    return {
+        "sourceNumber": sender,
+        "sourceName": sender_name,
+        "sourceUuid": sender_uuid,
+        "timestamp": timestamp_ms,
+        "dataMessage": {
+            "message": text,
+            "mentions": mentions or [],
+            "groupInfo": {
+                "groupId": group_id,
+                "groupName": group_name,
+            },
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +117,18 @@ class TestSignalAdapterInit:
     def test_init_parses_config(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch, group_allowed="group123,group456")
         assert adapter.http_url == "http://localhost:8080"
-        assert adapter.account == "+15551234567"
+        assert adapter.account.endswith("4567")
+        assert adapter.group_messages_enabled is True
         assert "group123" in adapter.group_allow_from
 
-    def test_init_empty_allowlist(self, monkeypatch):
+    def test_init_defaults_to_all_groups_when_unset(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
+        assert adapter.group_messages_enabled is True
+        assert "*" in adapter.group_allow_from
+
+    def test_init_can_disable_groups_explicitly(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, group_allowed="none")
+        assert adapter.group_messages_enabled is False
         assert len(adapter.group_allow_from) == 0
 
     def test_init_strips_trailing_slash(self, monkeypatch):
@@ -98,7 +137,7 @@ class TestSignalAdapterInit:
 
     def test_self_message_filtering(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
-        assert adapter._account_normalized == "+15551234567"
+        assert adapter._account_normalized.endswith("4567")
 
 
 class TestSignalConnectCleanup:
@@ -119,9 +158,12 @@ class TestSignalConnectCleanup:
 
         assert result is False
         mock_client.aclose.assert_awaited_once()
-        mock_release.assert_called_once_with("signal-phone", "+15551234567")
+        mock_release.assert_called_once()
+        assert mock_release.call_args.args[0] == "signal-phone"
+        assert str(mock_release.call_args.args[1]).endswith("4567")
         assert adapter.client is None
         assert adapter._platform_lock_identity is None
+
 
 
 class TestSignalHelpers:
@@ -248,7 +290,7 @@ class TestSignalAttachmentFetch:
         assert call["method"] == "getAttachment"
         assert call["params"]["id"] == "attachment-123"
         assert "attachmentId" not in call["params"], "Must NOT use 'attachmentId' — causes NullPointerException in signal-cli"
-        assert call["params"]["account"] == "+15551234567"
+        assert str(call["params"]["account"]).endswith("4567")
 
     @pytest.mark.asyncio
     async def test_fetch_attachment_returns_none_on_empty(self, monkeypatch):
@@ -283,8 +325,8 @@ class TestSignalSessionSource:
         from gateway.session import SessionSource
         source = SessionSource(
             platform=Platform.SIGNAL,
-            chat_id="+15551234567",
-            user_id="+15551234567",
+            chat_id="+155****4567",
+            user_id="+155****4567",
             user_id_alt="uuid:abc-123",
             chat_id_alt=None,
         )
@@ -298,7 +340,7 @@ class TestSignalSessionSource:
             platform=Platform.SIGNAL,
             chat_id="group:xyz",
             chat_type="group",
-            user_id="+15551234567",
+            user_id="+155****4567",
             user_id_alt="uuid:abc",
             chat_id_alt="xyz",
         )
@@ -309,9 +351,138 @@ class TestSignalSessionSource:
         assert restored.platform == Platform.SIGNAL
 
 
-# ---------------------------------------------------------------------------
-# Phone Redaction in agent/redact.py
-# ---------------------------------------------------------------------------
+class TestSignalGroupAddressing:
+    @pytest.mark.asyncio
+    async def test_group_message_works_in_any_group_when_unset(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, require_mention=True)
+        adapter.handle_message = AsyncMock()
+        adapter._get_group_context = AsyncMock(return_value={
+            "name": "Study Group",
+            "description": "",
+            "members": [],
+        })
+        adapter._build_group_context_block = AsyncMock(return_value="GROUP CONTEXT BLOCK")
+
+        envelope = _make_group_envelope(
+            text="hello \uFFFC",
+            mentions=[{"start": 6, "length": 1, "number": adapter.account}],
+        )
+
+        await adapter._handle_envelope(envelope)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_name == "Study Group"
+        assert event.source.chat_id == "group:group-123"
+        assert event.channel_context == "GROUP CONTEXT BLOCK"
+
+    @pytest.mark.asyncio
+    async def test_group_message_uses_group_name_and_context_when_mentioned(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, group_allowed="*", require_mention=True)
+        adapter.handle_message = AsyncMock()
+        adapter._get_group_context = AsyncMock(return_value={
+            "name": "Study Group",
+            "description": "",
+            "members": [{"name": "Bob", "number": "+177****2222", "uuid": "uuid:bob", "is_admin": True}],
+        })
+        adapter._build_group_context_block = AsyncMock(return_value="GROUP CONTEXT BLOCK")
+
+        envelope = _make_group_envelope(
+            text="hello \uFFFC",
+            mentions=[{"start": 6, "length": 1, "number": adapter.account}],
+        )
+
+        await adapter._handle_envelope(envelope)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_type == "group"
+        assert event.source.chat_id == "group:group-123"
+        assert event.source.chat_name == "Study Group"
+        assert event.channel_context == "GROUP CONTEXT BLOCK"
+        adapter._get_group_context.assert_awaited_once()
+        adapter._build_group_context_block.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_group_message_with_sancho_wake_word_triggers_without_llm(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, group_allowed="*", require_mention=True, address_detection_enabled=False)
+        adapter.handle_message = AsyncMock()
+        adapter._classify_group_message_as_addressed = AsyncMock()
+
+        envelope = _make_group_envelope(text="Sancho, can you help with this?")
+
+        await adapter._handle_envelope(envelope)
+
+        adapter.handle_message.assert_awaited_once()
+        adapter._classify_group_message_as_addressed.assert_not_awaited()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_type == "group"
+        assert event.source.chat_name == "Study Group"
+
+    @pytest.mark.asyncio
+    async def test_group_address_classifier_can_trigger_without_mention_by_default(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            group_allowed="*",
+            allowed_users="+177****2222",
+            require_mention=True,
+        )
+        assert adapter.address_detection_enabled is True
+        assert adapter.observe_unaddressed_group_messages is True
+        adapter.handle_message = AsyncMock()
+        adapter._build_group_context_block = AsyncMock(return_value="GROUP CONTEXT BLOCK")
+        adapter._classify_group_message_as_addressed = AsyncMock(return_value=True)
+
+        envelope = _make_group_envelope(sender="+166****1111", text="can you help me with this?")
+
+        await adapter._handle_envelope(envelope)
+
+        adapter._classify_group_message_as_addressed.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.channel_context == "GROUP CONTEXT BLOCK"
+
+    @pytest.mark.asyncio
+    async def test_group_follow_up_after_bot_reply_is_treated_as_addressed(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            group_allowed="*",
+            require_mention=True,
+            address_detection_enabled=False,
+        )
+        adapter._stop_typing_indicator = AsyncMock()
+        adapter._rpc = AsyncMock(return_value={"timestamp": 1720000000000})
+        adapter._record_group_outbound_message = AsyncMock()
+
+        send_result = await adapter.send("group:group-123", "Thanks — let’s keep going")
+        assert send_result.success is True
+        adapter._record_group_outbound_message.assert_awaited_once_with(
+            "group:group-123",
+            "Thanks — let’s keep going",
+        )
+
+        adapter.handle_message = AsyncMock()
+        adapter._build_group_context_block = AsyncMock(return_value="GROUP CONTEXT BLOCK")
+        adapter._classify_group_message_as_addressed = AsyncMock()
+
+        envelope = _make_group_envelope(text="here’s the next question, no name needed")
+        await adapter._handle_envelope(envelope)
+
+        adapter._classify_group_message_as_addressed.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_type == "group"
+        assert event.channel_context == "GROUP CONTEXT BLOCK"
+
+    def test_group_follow_up_window_expires(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, group_allowed="*")
+        adapter.group_followup_window_seconds = 30
+
+        adapter._mark_group_conversation_active("group:group-123", now=100.0)
+        assert adapter._group_conversation_is_active("group-123", now=129.0) is True
+        assert adapter._group_conversation_is_active("group-123", now=131.0) is False
+
+
 
 class TestSignalPhoneRedaction:
     @pytest.fixture(autouse=True)
@@ -417,6 +588,7 @@ class TestSignalSendImageFile:
         mock_rpc, captured = _stub_rpc({"timestamp": 1234567890})
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
+        adapter._record_group_outbound_message = AsyncMock()
 
         img_path = tmp_path / "photo.jpg"
         img_path.write_bytes(b"\xff\xd8" + b"\x00" * 100)
@@ -428,6 +600,10 @@ class TestSignalSendImageFile:
         assert result.success is True
         assert captured[0]["params"]["groupId"] == "abc123=="
         assert captured[0]["params"]["message"] == "Here's the chart"
+        adapter._record_group_outbound_message.assert_awaited_once_with(
+            "group:abc123==",
+            "Here's the chart",
+        )
 
     @pytest.mark.asyncio
     async def test_send_image_file_missing(self, monkeypatch):

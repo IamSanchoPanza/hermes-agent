@@ -296,7 +296,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `SIGNAL_HTTP_URL` | signal-cli 守护进程 HTTP 端点（例如 `http://127.0.0.1:8080`） |
 | `SIGNAL_ACCOUNT` | E.164 格式的 bot 手机号码 |
 | `SIGNAL_ALLOWED_USERS` | 逗号分隔的 E.164 手机号码或 UUID |
-| `SIGNAL_GROUP_ALLOWED_USERS` | 逗号分隔的群组 ID，或 `*` 表示所有群组 |
+| `SIGNAL_GROUP_ALLOWED_USERS` | 逗号分隔的群组 ID，`*` 表示所有群组，或 `none` 禁用群组 |
 | `SIGNAL_HOME_CHANNEL_NAME` | Signal 主频道的显示名称 |
 | `SIGNAL_IGNORE_STORIES` | 忽略 Signal 故事/状态更新 |
 | `SIGNAL_ALLOW_ALL_USERS` | 无需白名单允许所有 Signal 用户 |

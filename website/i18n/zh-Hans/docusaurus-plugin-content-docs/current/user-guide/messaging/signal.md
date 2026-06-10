@@ -107,7 +107,7 @@ SIGNAL_ACCOUNT=+1234567890
 SIGNAL_ALLOWED_USERS=+1234567890,+0987654321    # 逗号分隔的 E.164 号码或 UUID
 
 # 可选
-SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # 启用群组（省略则禁用，* 表示全部）
+SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # 启用群组（* 表示全部，none 表示禁用）
 SIGNAL_HOME_CHANNEL=+1234567890                  # cron 任务的默认投递目标
 ```
 
@@ -221,7 +221,7 @@ Signal 消息以**原生格式**渲染，而非显示原始 markdown 字符。�
 | **消息未收到** | 检查 `SIGNAL_ALLOWED_USERS` 是否包含发送方号码（E.164 格式，带 `+` 前缀） |
 | **"signal-cli not found on PATH"** | 安装 signal-cli 并确保其在 PATH 中，或使用 Docker |
 | **连接持续断开** | 检查 signal-cli 日志中的错误信息，确保已安装 Java 17+。 |
-| **群组消息被忽略** | 使用具体群组 ID 配置 `SIGNAL_GROUP_ALLOWED_USERS`，或设为 `*` 允许所有群组。 |
+| **群组消息被忽略** | 使用具体群组 ID 配置 `SIGNAL_GROUP_ALLOWED_USERS`，或设为 `*` 允许所有群组；用 `none` 禁用群组。 |
 | **机器人对所有人无响应** | 配置 `SIGNAL_ALLOWED_USERS`，使用私信配对，或通过 gateway 策略显式允许所有用户（如需更广泛的访问权限）。 |
 | **消息重复** | 确保只有一个 signal-cli 实例在监听你的手机号 |
 
@@ -248,6 +248,6 @@ Signal 消息以**原生格式**渲染，而非显示原始 markdown 字符。�
 | `SIGNAL_HTTP_URL` | 是 | — | signal-cli HTTP 端点 |
 | `SIGNAL_ACCOUNT` | 是 | — | 机器人手机号（E.164） |
 | `SIGNAL_ALLOWED_USERS` | 否 | — | 逗号分隔的手机号/UUID |
-| `SIGNAL_GROUP_ALLOWED_USERS` | 否 | — | 要监听的群组 ID，或 `*` 表示全部（省略则禁用群组） |
+| `SIGNAL_GROUP_ALLOWED_USERS` | 否 | `*` | 要监听的群组 ID，或 `*` 表示全部；使用 `none` 禁用群组 |
 | `SIGNAL_ALLOW_ALL_USERS` | 否 | `false` | 允许任意用户交互（跳过白名单） |
 | `SIGNAL_HOME_CHANNEL` | 否 | — | cron 任务的默认投递目标 |

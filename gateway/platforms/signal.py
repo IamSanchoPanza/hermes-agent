@@ -13,10 +13,12 @@ Requires:
 
 import asyncio
 import base64
+import dataclasses
 import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -73,6 +75,30 @@ HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before conc
 def _parse_comma_list(value: str) -> List[str]:
     """Split a comma-separated string into a list, stripping whitespace."""
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _parse_group_allowlist(raw_value: Optional[str]) -> tuple[bool, set[str]]:
+    """Parse Signal group access config.
+
+    Returns ``(enabled, allowlist)`` where:
+    - ``enabled`` False means group processing is fully disabled.
+    - ``allowlist`` empty means no restriction when ``enabled`` is True.
+
+    Defaults to allowing all groups when the env var is unset, so the bot can
+    participate in every Signal group it has joined without manual ID upkeep.
+    Explicit ``none``/``off``/``disabled`` disables groups for the rare case
+    where an operator wants DMs only.
+    """
+    text = str(raw_value or "").strip()
+    if not text:
+        return True, {"*"}
+
+    lowered = text.lower()
+    if lowered in {"none", "off", "disabled", "false", "0"}:
+        return False, set()
+
+    allowlist = set(_parse_comma_list(text))
+    return True, allowlist or {"*"}
 
 
 def _guess_extension(data: bytes) -> str:
@@ -162,6 +188,30 @@ def _looks_like_e164_number(value: str) -> bool:
     return digits.isdigit() and 7 <= len(digits) <= 15
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Best-effort bool parser for config/env values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off"}:
+        return False
+    return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    """Best-effort int parser for config/env values."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def check_signal_requirements() -> bool:
     """Check if Signal is configured (has URL and account)."""
     return bool(os.getenv("SIGNAL_HTTP_URL") and os.getenv("SIGNAL_ACCOUNT"))
@@ -188,9 +238,12 @@ class SignalAdapter(BasePlatformAdapter):
         self.account = extra.get("account", "")
         self.ignore_stories = extra.get("ignore_stories", True)
 
-        # Parse allowlists — group policy is derived from presence of group allowlist
-        group_allowed_str = os.getenv("SIGNAL_GROUP_ALLOWED_USERS", "")
-        self.group_allow_from = set(_parse_comma_list(group_allowed_str))
+        # Group policy: default to all groups, with optional restriction by
+        # explicit group IDs. ``none`` / ``off`` / ``disabled`` turns group
+        # processing off entirely.
+        self.group_messages_enabled, self.group_allow_from = _parse_group_allowlist(
+            os.getenv("SIGNAL_GROUP_ALLOWED_USERS")
+        )
 
         # Mention filter — only respond in groups when the bot account is @mentioned.
         # Read from config extra first, then SIGNAL_REQUIRE_MENTION env var.
@@ -208,6 +261,83 @@ class SignalAdapter(BasePlatformAdapter):
         # recorded at adapter level (run.py still enforces auth separately).
         dm_allowed_str = os.getenv("SIGNAL_ALLOWED_USERS", "*")
         self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
+
+        # Optional LLM-based "are they talking to Sancho?" gate for groups.
+        # Default on so plain name/addressed chatter in groups can still wake the bot
+        # without requiring an explicit @mention.
+        self.address_detection_enabled = _coerce_bool(
+            extra.get("address_detection_enabled"),
+            default=_coerce_bool(os.getenv("SIGNAL_ADDRESS_DETECTION_ENABLED"), True),
+        )
+
+        # Optional group-observe mode: remember group chatter as context but do
+        # not speak unless the message is explicitly or implicitly addressed.
+        # When the classifier is enabled, observing unaddressed chatter is on by
+        # default so the model has recent room context available on the next turn.
+        self.observe_unaddressed_group_messages = _coerce_bool(
+            extra.get("observe_unaddressed_group_messages"),
+            default=_coerce_bool(
+                os.getenv("SIGNAL_OBSERVE_UNADDRESSED_GROUP_MESSAGES"),
+                self.address_detection_enabled,
+            ),
+        )
+        self.group_context_window = max(
+            1,
+            _coerce_int(
+                extra.get("group_context_window"),
+                _coerce_int(os.getenv("SIGNAL_GROUP_CONTEXT_WINDOW"), 20),
+            ),
+        )
+        self.group_context_include_members = _coerce_bool(
+            extra.get("group_context_include_members"),
+            default=_coerce_bool(os.getenv("SIGNAL_GROUP_CONTEXT_INCLUDE_MEMBERS"), True),
+        )
+        self.group_context_include_description = _coerce_bool(
+            extra.get("group_context_include_description"),
+            default=_coerce_bool(os.getenv("SIGNAL_GROUP_CONTEXT_INCLUDE_DESCRIPTION"), True),
+        )
+
+        self.address_detection_provider = (
+            extra.get("address_detection_provider")
+            or os.getenv("SIGNAL_ADDRESS_DETECTION_PROVIDER")
+            or None
+        )
+        self.address_detection_model = (
+            extra.get("address_detection_model")
+            or os.getenv("SIGNAL_ADDRESS_DETECTION_MODEL")
+            or None
+        )
+        self.address_detection_base_url = (
+            extra.get("address_detection_base_url")
+            or os.getenv("SIGNAL_ADDRESS_DETECTION_BASE_URL")
+            or None
+        )
+        self.address_detection_api_key = (
+            extra.get("address_detection_api_key")
+            or os.getenv("SIGNAL_ADDRESS_DETECTION_API_KEY")
+            or None
+        )
+        self.address_detection_timeout = max(
+            1,
+            _coerce_int(
+                extra.get("address_detection_timeout"),
+                _coerce_int(os.getenv("SIGNAL_ADDRESS_DETECTION_TIMEOUT"), 15),
+            ),
+        )
+        self.group_context_cache_ttl_seconds = max(
+            10,
+            _coerce_int(
+                extra.get("group_context_cache_ttl_seconds"),
+                _coerce_int(os.getenv("SIGNAL_GROUP_CONTEXT_CACHE_TTL_SECONDS"), 300),
+            ),
+        )
+        self.group_followup_window_seconds = max(
+            10,
+            _coerce_int(
+                extra.get("group_followup_window_seconds"),
+                _coerce_int(os.getenv("SIGNAL_GROUP_FOLLOWUP_WINDOW_SECONDS"), 180),
+            ),
+        )
 
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
@@ -241,10 +371,24 @@ class SignalAdapter(BasePlatformAdapter):
         self._recipient_uuid_by_number: Dict[str, str] = {}
         self._recipient_number_by_uuid: Dict[str, str] = {}
         self._recipient_cache_lock = asyncio.Lock()
+        self._group_context_cache: Dict[str, Dict[str, Any]] = {}
+        self._group_context_cache_fetched_at = 0.0
+        self._group_context_cache_lock = asyncio.Lock()
+        self._group_conversation_activity: Dict[str, float] = {}
 
-        logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
-                     self.http_url, redact_phone(self.account),
-                     "enabled" if self.group_allow_from else "disabled")
+        group_mode = (
+            "disabled"
+            if not self.group_messages_enabled
+            else "all"
+            if "*" in self.group_allow_from
+            else f"restricted:{len(self.group_allow_from)}"
+        )
+        logger.info(
+            "Signal adapter initialized: url=%s account=%s groups=%s",
+            self.http_url,
+            redact_phone(self.account),
+            group_mode,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -503,22 +647,27 @@ class SignalAdapter(BasePlatformAdapter):
         group_id = group_info.get("groupId") if group_info else None
         is_group = bool(group_id)
 
-        # Group message filtering — derived from SIGNAL_GROUP_ALLOWED_USERS:
-        # - No env var set → groups disabled (default safe behavior)
-        # - Env var set with group IDs → only those groups allowed
-        # - Env var set with "*" → all groups allowed
-        # DM auth is fully handled by run.py (_is_user_authorized)
+        group_context: Optional[Dict[str, Any]] = None
         if is_group:
-            if not self.group_allow_from:
-                logger.debug("Signal: ignoring group message (no SIGNAL_GROUP_ALLOWED_USERS)")
+            # DM auth is fully handled by run.py (_is_user_authorized).
+            if not self.group_messages_enabled:
+                logger.debug("Signal: ignoring group message (groups disabled)")
                 return
             if "*" not in self.group_allow_from and group_id not in self.group_allow_from:
                 logger.debug("Signal: group %s not in allowlist", group_id[:8] if group_id else "?")
                 return
+            try:
+                group_context = await self._get_group_context(group_id, group_info)
+            except Exception:
+                logger.exception("Signal: failed to refresh group context cache")
+                group_context = None
 
         # Build chat info
         chat_id = sender if not is_group else f"group:{group_id}"
         chat_type = "group" if is_group else "dm"
+        resolved_group_name = None
+        if is_group:
+            resolved_group_name = (group_context or {}).get("name") or self._group_name_from_info(group_info)
 
         # Extract text and render mentions
         text = data_message.get("message", "")
@@ -526,27 +675,71 @@ class SignalAdapter(BasePlatformAdapter):
         if text and mentions:
             text = _render_mentions(text, mentions)
 
-        # Mention filter: in groups, only process messages that @mention the bot account
-        if is_group and self.require_mention:
-            account_norm = self._account_normalized
-            # Check rendered mention tags OR raw mention metadata
-            mentioned_in_text = account_norm and (
-                f"@{account_norm}" in (text or "")
-            )
-            mentioned_in_metadata = any(
-                m.get("number") == account_norm or m.get("uuid") == account_norm
-                for m in (data_message.get("mentions") or [])
-            )
-            if not mentioned_in_text and not mentioned_in_metadata:
-                logger.debug(
-                    "Signal: ignoring group message (require_mention=true, bot not mentioned)"
-                )
-                return
-
         # Extract quote (reply-to) context from Signal dataMessage
         quote_data = data_message.get("quote") or {}
         reply_to_id = str(quote_data.get("id")) if quote_data.get("id") else None
         reply_to_text = quote_data.get("text")
+
+        # Parse timestamp from envelope data (milliseconds since epoch)
+        ts_ms = envelope_data.get("timestamp", 0)
+        if ts_ms:
+            try:
+                timestamp = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            except (ValueError, OSError):
+                timestamp = datetime.now(tz=timezone.utc)
+        else:
+            timestamp = datetime.now(tz=timezone.utc)
+
+        # Build session source
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=resolved_group_name if is_group else sender_name,
+            chat_type=chat_type,
+            user_id=sender,
+            user_name=sender_name or sender,
+            user_id_alt=sender_uuid if sender_uuid else None,
+            chat_id_alt=group_id if is_group else None,
+        )
+
+        group_context_block: Optional[str] = None
+        if is_group:
+            # Fast path: real mention or direct reply to the bot.
+            addressed = self._message_mentions_bot(text, data_message) or self._quote_targets_bot(quote_data)
+            if not addressed:
+                # Optional AI fallback: decide whether the sender is talking to Sancho.
+                # Group address detection is intentionally evaluated before any DM
+                # allowlist so a real group participant can trigger the bot even
+                # when SIGNAL_ALLOWED_USERS is scoped to a small DM set.
+                if self.address_detection_enabled:
+                    try:
+                        addressed = await self._classify_group_message_as_addressed(
+                            source=source,
+                            text=text,
+                            group_info=group_info,
+                        )
+                    except Exception:
+                        logger.exception("Signal: group address detection failed")
+                        addressed = False
+            if addressed:
+                await self._record_group_message(
+                    source,
+                    text,
+                    role="user",
+                    observed=False,
+                    message_id=str(ts_ms) if ts_ms else None,
+                )
+            else:
+                await self._observe_unaddressed_group_message(
+                    source,
+                    text,
+                    message_id=str(ts_ms) if ts_ms else None,
+                )
+
+            try:
+                group_context_block = await self._build_group_context_block(source, group_info)
+            except Exception:
+                logger.exception("Signal: failed to build group context block")
+                group_context_block = None
 
         # Process attachments
         attachments_data = data_message.get("attachments", [])
@@ -584,17 +777,6 @@ class SignalAdapter(BasePlatformAdapter):
             )
             return
 
-        # Build session source
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=group_info.get("groupName") if group_info else sender_name,
-            chat_type=chat_type,
-            user_id=sender,
-            user_name=sender_name or sender,
-            user_id_alt=sender_uuid if sender_uuid else None,
-            chat_id_alt=group_id if is_group else None,
-        )
-
         # Determine message type from media
         msg_type = MessageType.TEXT
         if media_types:
@@ -602,16 +784,6 @@ class SignalAdapter(BasePlatformAdapter):
                 msg_type = MessageType.VOICE
             elif any(mt.startswith("image/") for mt in media_types):
                 msg_type = MessageType.PHOTO
-
-        # Parse timestamp from envelope data (milliseconds since epoch)
-        ts_ms = envelope_data.get("timestamp", 0)
-        if ts_ms:
-            try:
-                timestamp = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            except (ValueError, OSError):
-                timestamp = datetime.now(tz=timezone.utc)
-        else:
-            timestamp = datetime.now(tz=timezone.utc)
 
         # Build and dispatch event.
         # Store raw envelope data in raw_message so on_processing_start/complete
@@ -626,6 +798,7 @@ class SignalAdapter(BasePlatformAdapter):
             raw_message={"sender": sender, "timestamp_ms": ts_ms},
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
+            channel_context=group_context_block,
         )
 
         logger.debug("Signal: message from %s in %s: %s",
@@ -658,6 +831,373 @@ class SignalAdapter(BasePlatformAdapter):
             if matches_number:
                 return service_id
         return None
+
+    @staticmethod
+    def _group_name_from_info(group_info: Optional[dict]) -> Optional[str]:
+        if not isinstance(group_info, dict):
+            return None
+        return group_info.get("groupName") or group_info.get("name") or None
+
+    def _sender_can_activate_group(self, sender: Optional[str], sender_uuid: Optional[str]) -> bool:
+        """Cheap prefilter before we spend tokens on addressed-message detection."""
+        if not self.dm_allow_from or "*" in self.dm_allow_from:
+            return True
+        candidates = {str(sender or "").strip(), str(sender_uuid or "").strip()}
+        candidates.discard("")
+        return any(candidate in self.dm_allow_from for candidate in candidates)
+
+    def _message_mentions_bot(self, text: str, data_message: dict) -> bool:
+        account_norm = self._account_normalized
+        text_value = text or ""
+        mentioned_in_text = bool(account_norm and f"@{account_norm}" in text_value)
+        mentioned_by_wake_word = bool(re.search(r"\bsancho\b", text_value, flags=re.IGNORECASE))
+        mentioned_in_metadata = any(
+            m.get("number") == account_norm or m.get("uuid") == account_norm
+            for m in (data_message.get("mentions") or [])
+            if isinstance(m, dict)
+        )
+        return mentioned_in_text or mentioned_by_wake_word or mentioned_in_metadata
+
+    def _mark_group_conversation_active(self, chat_id: str, now: Optional[float] = None) -> None:
+        """Remember that a group is in an active back-and-forth window."""
+        if not chat_id.startswith("group:"):
+            return
+        group_id = chat_id[6:]
+        now = time.monotonic() if now is None else now
+        self._prune_group_conversation_activity(now)
+        self._group_conversation_activity[group_id] = now
+
+    def _group_conversation_is_active(self, group_id: str, now: Optional[float] = None) -> bool:
+        if not group_id:
+            return False
+        now = time.monotonic() if now is None else now
+        started_at = self._group_conversation_activity.get(group_id)
+        if started_at is None:
+            return False
+        if now - started_at > self.group_followup_window_seconds:
+            self._group_conversation_activity.pop(group_id, None)
+            return False
+        return True
+
+    def _prune_group_conversation_activity(self, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        stale = [
+            group_id
+            for group_id, started_at in self._group_conversation_activity.items()
+            if now - started_at > self.group_followup_window_seconds
+        ]
+        for group_id in stale:
+            self._group_conversation_activity.pop(group_id, None)
+
+    def _quote_targets_bot(self, quote_data: dict) -> bool:
+        if not isinstance(quote_data, dict):
+            return False
+        author = str(quote_data.get("author") or "").strip()
+        if not author:
+            return False
+        return author == self._account_normalized
+
+    def _signal_group_shared_source(self, source):
+        """Observed group chatter should accumulate in one shared per-group session."""
+        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+
+    @staticmethod
+    def _signal_group_attributed_text(source, text: str) -> str:
+        user_id = source.user_id or source.user_id_alt or "unknown"
+        sender = source.user_name or user_id
+        return f"[{sender}|{user_id}]\n{text or ''}"
+
+    async def _record_group_message(
+        self,
+        source,
+        text: str,
+        *,
+        role: str = "user",
+        observed: bool = False,
+        message_id: Optional[str] = None,
+    ) -> None:
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            shared_source = self._signal_group_shared_source(source)
+            session_entry = store.get_or_create_session(shared_source)
+            if role == "assistant":
+                content = str(text or "").strip()
+            else:
+                content = self._signal_group_attributed_text(source, text)
+            entry = {
+                "role": role,
+                "content": content,
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": observed,
+            }
+            if message_id:
+                entry["message_id"] = str(message_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+        except Exception:
+            logger.exception("Signal: failed to record group message")
+
+    async def _observe_unaddressed_group_message(
+        self,
+        source,
+        text: str,
+        *,
+        message_id: Optional[str] = None,
+    ) -> None:
+        await self._record_group_message(
+            source,
+            text,
+            role="user",
+            observed=True,
+            message_id=message_id,
+        )
+
+    async def _load_group_conversation_context(self, source, *, limit: Optional[int] = None) -> Optional[str]:
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return None
+        try:
+            shared_source = self._signal_group_shared_source(source)
+            session_entry = store.get_or_create_session(shared_source)
+            history = store.load_transcript(session_entry.session_id)
+        except Exception:
+            logger.exception("Signal: failed to load group conversation context")
+            return None
+        lines = []
+        for msg in history or []:
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            role = str(msg.get("role") or "").strip().lower()
+            if role == "assistant":
+                lines.append(f"[Sancho|assistant]\n{content}")
+            else:
+                lines.append(content)
+        if limit:
+            lines = lines[-limit:]
+        return "\n".join(line for line in lines if line).strip() or None
+
+    async def _record_group_outbound_message(self, chat_id: str, content: str) -> None:
+        if not chat_id.startswith("group:"):
+            return
+        try:
+            source = self.build_source(chat_id=chat_id, chat_type="group")
+            await self._record_group_message(
+                source,
+                content,
+                role="assistant",
+                observed=False,
+            )
+        except Exception:
+            logger.exception("Signal: failed to record outbound group message")
+
+    @staticmethod
+    def _contact_display_name(contact: dict) -> str:
+        if not isinstance(contact, dict):
+            return ""
+        candidates = [
+            contact.get("nickName"),
+            contact.get("name"),
+            " ".join(
+                part.strip()
+                for part in [contact.get("givenName") or "", contact.get("familyName") or ""]
+                if part and str(part).strip()
+            ).strip(),
+            " ".join(
+                part.strip()
+                for part in [
+                    (contact.get("profile") or {}).get("givenName") if isinstance(contact.get("profile"), dict) else "",
+                    (contact.get("profile") or {}).get("familyName") if isinstance(contact.get("profile"), dict) else "",
+                ]
+                if part and str(part).strip()
+            ).strip(),
+            contact.get("username"),
+            contact.get("number"),
+            contact.get("uuid"),
+        ]
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text:
+                return text
+        return ""
+
+    async def _refresh_group_context_cache(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and self._group_context_cache and now - self._group_context_cache_fetched_at < self.group_context_cache_ttl_seconds:
+            return
+        async with self._group_context_cache_lock:
+            now = time.time()
+            if not force and self._group_context_cache and now - self._group_context_cache_fetched_at < self.group_context_cache_ttl_seconds:
+                return
+            groups = await self._rpc("listGroups", {"account": self.account}) or []
+            contacts = await self._rpc("listContacts", {"account": self.account, "allRecipients": True}) or []
+
+            number_to_name: Dict[str, str] = {}
+            uuid_to_name: Dict[str, str] = {}
+            if isinstance(contacts, list):
+                for contact in contacts:
+                    if not isinstance(contact, dict):
+                        continue
+                    display = self._contact_display_name(contact)
+                    number = str(contact.get("number") or "").strip()
+                    contact_uuid = str(contact.get("uuid") or "").strip()
+                    if number and display:
+                        number_to_name[number] = display
+                    if contact_uuid and display:
+                        uuid_to_name[contact_uuid] = display
+                    if number and contact_uuid:
+                        self._remember_recipient_identifiers(number, contact_uuid)
+
+            cache: Dict[str, Dict[str, Any]] = {}
+            if isinstance(groups, list):
+                for group in groups:
+                    if not isinstance(group, dict):
+                        continue
+                    group_id = str(group.get("id") or group.get("groupId") or "").strip()
+                    if not group_id:
+                        continue
+                    members = []
+                    for member in group.get("members") or []:
+                        if not isinstance(member, dict):
+                            continue
+                        member_number = str(member.get("number") or "").strip()
+                        member_uuid = str(member.get("uuid") or "").strip()
+                        display = (
+                            uuid_to_name.get(member_uuid)
+                            or number_to_name.get(member_number)
+                            or member_number
+                            or member_uuid
+                            or "unknown"
+                        )
+                        members.append({
+                            "name": display,
+                            "number": member_number,
+                            "uuid": member_uuid,
+                            "is_admin": bool(member.get("isAdmin")),
+                        })
+                    cache[group_id] = {
+                        "name": self._group_name_from_info(group),
+                        "description": str(group.get("description") or "").strip(),
+                        "members": members,
+                    }
+
+            self._group_context_cache = cache
+            self._group_context_cache_fetched_at = time.time()
+
+    async def _get_group_context(self, group_id: Optional[str], group_info: Optional[dict]) -> Dict[str, Any]:
+        if group_id:
+            try:
+                await self._refresh_group_context_cache()
+            except Exception:
+                logger.exception("Signal: failed to refresh group context cache")
+            cached = self._group_context_cache.get(group_id)
+            if cached:
+                return cached
+        return {
+            "name": self._group_name_from_info(group_info),
+            "description": str((group_info or {}).get("description") or "").strip(),
+            "members": [],
+        }
+
+    @staticmethod
+    def _member_display_line(member: dict) -> str:
+        name = str(member.get("name") or member.get("number") or member.get("uuid") or "unknown").strip()
+        identifier = str(member.get("number") or member.get("uuid") or "").strip()
+        admin_suffix = " (admin)" if member.get("is_admin") else ""
+        if identifier and identifier != name:
+            return f"- {name} — {identifier}{admin_suffix}"
+        return f"- {name}{admin_suffix}"
+
+    async def _build_group_context_block(self, source, group_info: Optional[dict]) -> Optional[str]:
+        group_id = getattr(source, "chat_id_alt", None)
+        context = await self._get_group_context(group_id, group_info)
+        group_name = context.get("name") or source.chat_name or source.chat_id
+        recent = await self._load_group_conversation_context(source, limit=self.group_context_window)
+
+        lines = ["[Signal group context - context only, not requests]", f"Group: {group_name}"]
+        description = str(context.get("description") or "").strip()
+        if description and self.group_context_include_description:
+            lines.append(f"Description: {description}")
+        members = context.get("members") or []
+        if members and self.group_context_include_members:
+            lines.append("Members:")
+            lines.extend(self._member_display_line(member) for member in members)
+        if recent:
+            lines.append("")
+            lines.append("Recent group conversation:")
+            lines.append(recent)
+        return "\n".join(line for line in lines if line is not None).strip() or None
+
+    def _signal_group_channel_prompt(self, group_name: Optional[str]) -> str:
+        group_label = group_name or "this Signal group"
+        return (
+            "You are participating in a Signal group chat as Sancho.\n"
+            f"- Current group: {group_label}\n"
+            "- Group context, member list, and recent chatter may appear in a separate context block before the new message.\n"
+            "- Treat that block as background only; answer only the current new message.\n"
+            "- The current message is attributed as `[name|id]` so you can tell who is speaking.\n"
+            "- Be socially aware of the whole room, but do not pretend earlier observed chatter was a direct request."
+        )
+
+    @staticmethod
+    def _extract_llm_text(response: Any) -> str:
+        try:
+            choice = response.choices[0]
+        except Exception:
+            return ""
+        message = getattr(choice, "message", None)
+        if message is None and isinstance(choice, dict):
+            message = choice.get("message")
+        content = getattr(message, "content", None) if message is not None else None
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+            return "\n".join(part for part in parts if part).strip()
+        return str(content or "").strip()
+
+    async def _classify_group_message_as_addressed(
+        self,
+        *,
+        source,
+        text: str,
+        group_info: Optional[dict],
+    ) -> bool:
+        from agent.auxiliary_client import async_call_llm
+
+        group_context = await self._build_group_context_block(source, group_info)
+        prompt = (
+            "Decide whether the NEWEST message in this Signal group chat is addressed to Sancho, the assistant. "
+            "Reply with exactly YES or NO.\n\n"
+            "Return YES when the sender is clearly asking Sancho to respond, help, answer, summarize, or take action, "
+            "even without a strict wake word.\n"
+            "Return NO when the sender is talking to other humans, thinking out loud, or making general group chatter that is not for Sancho."
+        )
+        current_message = self._signal_group_attributed_text(source, text)
+        if group_context:
+            prompt = f"{prompt}\n\n{group_context}\n\n[Current newest message]\n{current_message}"
+        else:
+            prompt = f"{prompt}\n\n[Current newest message]\n{current_message}"
+        response = await async_call_llm(
+            task=None,
+            provider=self.address_detection_provider,
+            model=self.address_detection_model,
+            base_url=self.address_detection_base_url,
+            api_key=self.address_detection_api_key,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=8,
+            timeout=float(self.address_detection_timeout),
+        )
+        text_out = self._extract_llm_text(response)
+        match = re.search(r"\b(YES|NO)\b", text_out.upper())
+        return bool(match and match.group(1) == "YES")
 
     async def _resolve_recipient(self, chat_id: str) -> str:
         """Return the preferred Signal recipient identifier for a direct chat."""
@@ -988,6 +1528,8 @@ class SignalAdapter(BasePlatformAdapter):
 
         if result is not None:
             self._track_sent_timestamp(result)
+            self._mark_group_conversation_active(chat_id)
+            await self._record_group_outbound_message(chat_id, content)
             # Signal has no editable message identifier. Returning None keeps the
             # stream consumer on the non-edit fallback path instead of pretending
             # future edits can remove an in-progress cursor from the chat thread.
@@ -1164,6 +1706,11 @@ class SignalAdapter(BasePlatformAdapter):
                     _rpc_duration = time.monotonic() - _rpc_t0
                     if result is not None:
                         self._track_sent_timestamp(result)
+                        self._mark_group_conversation_active(chat_id)
+                        await self._record_group_outbound_message(
+                            chat_id,
+                            f"[sent {len(att_batch)} image attachments]",
+                        )
                         await scheduler.report_rpc_duration(_rpc_duration, n)
                         logger.info(
                             "Signal batch %d/%d: %d attachments sent in %.1fs "
@@ -1270,6 +1817,8 @@ class SignalAdapter(BasePlatformAdapter):
         result = await self._rpc("send", params)
         if result is not None:
             self._track_sent_timestamp(result)
+            self._mark_group_conversation_active(chat_id)
+            await self._record_group_outbound_message(chat_id, caption or "[image]")
             return SendResult(success=True)
         return SendResult(success=False, error="RPC send with attachment failed")
 
@@ -1309,6 +1858,11 @@ class SignalAdapter(BasePlatformAdapter):
         result = await self._rpc("send", params)
         if result is not None:
             self._track_sent_timestamp(result)
+            self._mark_group_conversation_active(chat_id)
+            await self._record_group_outbound_message(
+                chat_id,
+                caption or f"[{media_label.lower()} attachment]",
+            )
             return SendResult(success=True)
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 

@@ -5657,10 +5657,11 @@ def _setup_signal():
     # Group messaging
     print()
     if prompt_yes_no(
-        "  Enable group messaging? (disabled by default for security)", False
+        "  Enable group messaging? (bot can join all groups by default)", False
     ):
         print()
         print_info("  Enter group IDs to allow, or * for all groups.")
+        print_info("  Use none to disable group messaging entirely.")
         existing_groups = get_env_value("SIGNAL_GROUP_ALLOWED_USERS") or ""
         try:
             groups = (
@@ -5672,6 +5673,8 @@ def _setup_signal():
             print("\n  Setup cancelled.")
             return
         save_env_value("SIGNAL_GROUP_ALLOWED_USERS", groups)
+    else:
+        save_env_value("SIGNAL_GROUP_ALLOWED_USERS", "none")
 
     print()
     print_success("Signal configured!")
@@ -5679,7 +5682,7 @@ def _setup_signal():
     print_info(f"  Account: {account}")
     print_info("  DM auth: via SIGNAL_ALLOWED_USERS + DM pairing")
     print_info(
-        f"  Groups: {'enabled' if get_env_value('SIGNAL_GROUP_ALLOWED_USERS') else 'disabled'}"
+        f"  Groups: {'disabled' if (get_env_value('SIGNAL_GROUP_ALLOWED_USERS') or '').strip().lower() in {'none', 'off', 'disabled'} else 'enabled'}"
     )
 
 
