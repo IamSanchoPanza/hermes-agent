@@ -1123,6 +1123,11 @@ DEFAULT_CONFIG = {
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
+        "local_threshold": None,      # optional lower ratio for LOCAL endpoints
+                                      # (ollama / LM Studio / RFC-1918 hosts), where
+                                      # prompt prefill is re-paid every turn. Bypasses
+                                      # the 64K minimum-threshold floor (8K floor
+                                      # instead). None = use `threshold`.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count

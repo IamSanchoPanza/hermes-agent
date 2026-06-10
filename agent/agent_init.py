@@ -1308,6 +1308,15 @@ def init_agent(
     except Exception:
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    # Optional lower threshold for local endpoints (ollama/LM Studio etc.),
+    # where prompt prefill is paid in full every turn.  None = use `threshold`.
+    _raw_local_threshold = _compression_cfg.get("local_threshold")
+    compression_local_threshold = None
+    if _raw_local_threshold not in {None, ""}:
+        try:
+            compression_local_threshold = float(_raw_local_threshold)
+        except (TypeError, ValueError):
+            pass
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # protect_first_n is the number of non-system messages to protect at
@@ -1528,6 +1537,7 @@ def init_agent(
         agent.context_compressor = ContextCompressor(
             model=agent.model,
             threshold_percent=compression_threshold,
+            local_threshold_percent=compression_local_threshold,
             protect_first_n=compression_protect_first,
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,

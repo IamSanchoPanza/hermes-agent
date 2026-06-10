@@ -29,7 +29,16 @@ from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
     estimate_messages_tokens_rough,
+    is_local_endpoint,
 )
+
+# Floor for the ``compression.local_threshold`` override.  Local endpoints
+# deliberately bypass MINIMUM_CONTEXT_LENGTH (64K) — that floor exists to
+# avoid premature compaction on cloud models where large prompts are cheap,
+# but a local model re-processes the full prompt every turn, so aggressive
+# compaction is the whole point of the override.  This smaller floor only
+# guards against thrashing (compressing every couple of messages).
+LOCAL_MINIMUM_THRESHOLD_TOKENS = 8_192
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -585,10 +594,9 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
-        self.threshold_tokens = max(
-            int(context_length * self.threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
-        )
+        # Re-evaluates the local-endpoint override too: a fallback switch to
+        # a local model (cloud 429 → ollama) should adopt the local threshold.
+        self.threshold_tokens = self._compute_threshold_tokens()
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
@@ -597,10 +605,30 @@ class ContextCompressor(ContextEngine):
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
+    def _compute_threshold_tokens(self) -> int:
+        """Token threshold for the active endpoint.
+
+        Uses ``local_threshold_percent`` (config ``compression.local_threshold``)
+        when the active base_url is a local endpoint — local models pay full
+        prompt-processing cost every turn, so compaction should kick in far
+        earlier than for cloud providers.  Reads ``self.base_url`` /
+        ``self.context_length``, so callers must set those first.
+        """
+        if self.local_threshold_percent is not None and is_local_endpoint(self.base_url):
+            return max(
+                int(self.context_length * self.local_threshold_percent),
+                LOCAL_MINIMUM_THRESHOLD_TOKENS,
+            )
+        return max(
+            int(self.context_length * self.threshold_percent),
+            MINIMUM_CONTEXT_LENGTH,
+        )
+
     def __init__(
         self,
         model: str,
         threshold_percent: float = 0.50,
+        local_threshold_percent: float | None = None,
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
@@ -619,6 +647,7 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.threshold_percent = threshold_percent
+        self.local_threshold_percent = local_threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
@@ -637,11 +666,9 @@ class ContextCompressor(ContextEngine):
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
         # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
-        self.threshold_tokens = max(
-            int(self.context_length * threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
-        )
+        # for models right at the minimum.  (Local endpoints may opt into a
+        # lower threshold + floor — see _compute_threshold_tokens.)
+        self.threshold_tokens = self._compute_threshold_tokens()
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context
