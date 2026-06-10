@@ -91,6 +91,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda *args, **kwargs: None)
 
         calls = []
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -1398,6 +1399,33 @@ class TestGatewaySystemServiceRouting:
             raise AssertionError("Expected gateway_command to exit when service restart fails")
 
         assert run_calls == []
+
+    def test_gateway_restart_inside_gateway_uses_launchd_restart(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist\n", encoding="utf-8")
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "launchd_restart",
+            lambda: calls.append("launchd_restart"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "run_gateway",
+            lambda verbose=0, quiet=False, replace=False: calls.append("run_gateway"),
+        )
+        monkeypatch.setattr(gateway_cli, "kill_gateway_processes", lambda force=False: 0)
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="restart", system=False))
+
+        assert calls == ["launchd_restart"]
 
 
 class TestDetectVenvDir:
