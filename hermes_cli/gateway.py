@@ -3364,17 +3364,51 @@ def refresh_launchd_plist_if_needed() -> bool:
 
     plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
     label = get_launchd_label()
+    target = f"{_launchd_domain()}/{label}"
     # Bootout/bootstrap so launchd picks up the new definition
     subprocess.run(
-        ["launchctl", "bootout", f"{_launchd_domain()}/{label}"],
+        ["launchctl", "bootout", target],
         check=False,
         timeout=90,
     )
-    subprocess.run(
-        ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-        check=False,
-        timeout=30,
-    )
+    # bootout returns before the old instance has fully drained, and
+    # bootstrapping while the label still exists fails with EIO (5). If that
+    # failure is ignored the service ends up unregistered — which KeepAlive
+    # cannot recover from — while the caller goes on to print success. Wait
+    # for the label to clear, then bootstrap with retries, and surface a
+    # failure instead of leaving the gateway silently unloaded.
+    import time
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        probe = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            break
+        time.sleep(1)
+
+    bootstrap_rc = None
+    for delay in (0, 2, 5):
+        if delay:
+            time.sleep(delay)
+        result = subprocess.run(
+            ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        bootstrap_rc = result.returncode
+        if bootstrap_rc == 0:
+            break
+
+    if bootstrap_rc != 0:
+        print(f"✗ launchctl bootstrap failed (exit {bootstrap_rc}); gateway service is NOT loaded")
+        print(f"  Recover with: launchctl bootstrap {_launchd_domain()} {plist_path}")
+        return False
+
     print(
         "↻ Updated gateway launchd service definition to match the current Hermes install"
     )
